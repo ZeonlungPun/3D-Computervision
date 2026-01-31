@@ -20,6 +20,16 @@ std::vector<Eigen::Vector3d>cart2hom(std::vector<cv::Point2f>pt_group)
 
 }
 
+// 將旋轉向量轉換為 3x3 反對稱矩陣
+Eigen::Matrix3d Skew(const Eigen::Vector3d& w) {
+    Eigen::Matrix3d W;
+    W <<     0, -w(2),  w(1),
+          w(2),     0, -w(0),
+         -w(1),  w(0),     0;
+    return W;
+}
+
+
 Eigen::Vector2d ReconstructionError(Eigen::Vector4d P_3d,Eigen::Matrix<double, 3, 4> project_matrix,Eigen::Vector2d p_2d_obs)
 {
     /*
@@ -80,24 +90,17 @@ Eigen::Matrix<double, 2, 3> JacobianWrtTranslation(Eigen::Matrix<double, 3, 4> p
 }
 
 Eigen::Matrix<double, 2, 3> JacobianWrtRotation
-(Eigen::Matrix<double, 2, 3> J_T ,Eigen::Matrix<double, 3, 4> project_matrix,
-    const Eigen::Vector4d& P_3d  )
+(Eigen::Matrix<double, 2, 3>& J_pt ,Eigen::Matrix<double, 3, 3>& Rotation_matrix,
+    const Eigen::Vector3d& P_3d  )
 {
-    Eigen::Vector3d p = project_matrix * P_3d;
-    double px = p(0), py = p(1), pz = p(2);
-    
-    Eigen::Matrix3d skew_m;
-
-    skew_m <<  0,   -pz,  py,
-           pz,   0,  -px,
-          -py,  px,   0;
-    Eigen::Matrix<double, 2, 3> J=J_T*skew_m;
+    Eigen::Vector3d temp_vec = Rotation_matrix*P_3d;
+    Eigen::Matrix3d skew_m=Skew(temp_vec);
+    Eigen::Matrix<double, 2, 3> J=J_pt*(-skew_m);
 
     return J;
 
 
 }
-
 
 Eigen::VectorXd BA_CostFunction(
     const std::vector<Eigen::Vector4d>& tripoints3d,
@@ -118,9 +121,12 @@ Eigen::VectorXd BA_CostFunction(
 
     for (int i = 0; i < num_points; ++i) {
         const Eigen::Vector4d& P_3d = tripoints3d[i];
+        Eigen::Vector3d P_nonhomo_3d = P_3d.hnormalized();
 
         for (int j = 0; j < num_cameras; ++j) {
             const Eigen::Matrix<double, 3, 4>& P = project_matrix_list[j];
+
+            Eigen::Matrix<double,3,3> Rotate_matrix = P.block<3, 3>(0, 0);
 
             int row = 2 * (i * num_cameras + j);   // 2 行對應 (i,j)
             int col_point = 3 * i;                 // 3 列對應第 i 個 3D 點
@@ -140,7 +146,7 @@ Eigen::VectorXd BA_CostFunction(
             // 對相機 pose 的 Jacobian（2x6），但若 j==0 則跳過（第一相機固定）
             if (j > 0) {
                 Eigen::Matrix<double, 2, 3> J_T = JacobianWrtTranslation(P, P_3d);
-                Eigen::Matrix<double, 2, 3> J_R = JacobianWrtRotation(J_T, P, P_3d);
+                Eigen::Matrix<double, 2, 3> J_R = JacobianWrtRotation(J_pt, Rotate_matrix, P_nonhomo_3d);
                 Eigen::Matrix<double, 2, 6> J_pose;
                 J_pose.block<2, 3>(0, 0) = J_R;
                 J_pose.block<2, 3>(0, 3) = J_T;
@@ -192,7 +198,7 @@ void LM_update(std::vector<Eigen::Vector4d>& tripoints3d,
             return;
         }
 
-        float old_cost = TotalReconstructionError(tripoints3d, project_matrix_list, const_cast<std::vector<Eigen::Vector2d>&>(p_2d_obs_list));
+        double old_cost = TotalReconstructionError(tripoints3d, project_matrix_list, const_cast<std::vector<Eigen::Vector2d>&>(p_2d_obs_list));
 
         // 保存 old state in case we need to rollback
         auto old_points = tripoints3d;
@@ -211,7 +217,7 @@ void LM_update(std::vector<Eigen::Vector4d>& tripoints3d,
             UpdateCameraPose(project_matrix_list[j], dPose);
         }
 
-        float new_cost = TotalReconstructionError(tripoints3d, project_matrix_list, const_cast<std::vector<Eigen::Vector2d>&>(p_2d_obs_list));
+        double new_cost = TotalReconstructionError(tripoints3d, project_matrix_list, const_cast<std::vector<Eigen::Vector2d>&>(p_2d_obs_list));
 
         std::cout << "iter " << it << " cost: " << old_cost << " -> " << new_cost << std::endl;
 
@@ -227,11 +233,11 @@ void LM_update(std::vector<Eigen::Vector4d>& tripoints3d,
     }
 }
 
-float TotalReconstructionError(std::vector<Eigen::Vector4d>& tripoints3d,
+double TotalReconstructionError(std::vector<Eigen::Vector4d>& tripoints3d,
     std::vector<Eigen::Matrix<double, 3, 4>>& project_matrix_list,
     std::vector<Eigen::Vector2d>& p_2d_obs_list)
 {
-    float total_error=0;
+    double total_error=0;
     int num_points = tripoints3d.size();
     int num_cameras = project_matrix_list.size();
 
@@ -249,58 +255,32 @@ float TotalReconstructionError(std::vector<Eigen::Vector4d>& tripoints3d,
 }
 
 
-// 將旋轉向量轉換為 3x3 反對稱矩陣
-Eigen::Matrix3d Skew(const Eigen::Vector3d& w) {
-    Eigen::Matrix3d W;
-    W <<     0, -w(2),  w(1),
-          w(2),     0, -w(0),
-         -w(1),  w(0),     0;
-    return W;
-}
 
-// se(3) → SE(3) (指數映射)
-Eigen::Matrix4d ExpSE3(const Eigen::Matrix<double,6,1>& xi) {
-    Eigen::Vector3d omega = xi.head<3>();
-    Eigen::Vector3d v     = xi.tail<3>();
 
-    double theta = omega.norm();
-    Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
-    Eigen::Matrix3d Omega = Skew(omega);
-
-    Eigen::Matrix3d V = Eigen::Matrix3d::Identity();
-
-    if (theta < 1e-12) {
-        // 小角度近似
-        R = Eigen::Matrix3d::Identity() + Omega;
-        V = Eigen::Matrix3d::Identity() + 0.5 * Omega;
-    } else {
-        R = Eigen::AngleAxisd(theta, omega.normalized()).toRotationMatrix();
-        V = Eigen::Matrix3d::Identity() +
-            (1 - cos(theta)) / (theta*theta) * Omega +
-            (theta - sin(theta)) / (theta*theta*theta) * (Omega * Omega);
-    }
-
-    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-    T.block<3,3>(0,0) = R;
-    T.block<3,1>(0,3) = V * v;
-
-    return T;
-}
 
 // 更新相機投影矩陣 [R|t]
-void UpdateCameraPose(Eigen::Matrix<double,3,4>& project_matrix, const Eigen::Matrix<double,6,1>& dPose) {
-    // 1. 轉成齊次矩陣 T
-    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-    T.block<3,3>(0,0) = project_matrix.block<3,3>(0,0);
-    T.block<3,1>(0,3) = project_matrix.block<3,1>(0,3);
+void UpdateCameraPose(Eigen::Matrix<double,3,4>& project_matrix, const Eigen::Matrix<double,6,1>& dPose) 
+{
+    Eigen::Vector3d delta_omega = dPose.segment<3>( 0);
+    Eigen::Vector3d delta_t     = dPose.segment<3>( 3);
 
-    // 2. 指數映射增量
-    Eigen::Matrix4d dT = ExpSE3(dPose);
+    Eigen::Matrix3d R = project_matrix.block<3,3>(0,0);
+    Eigen::Vector3d t =  project_matrix.block<3,1>(0,3);
 
-    // 3. 更新
-    Eigen::Matrix4d T_new = dT * T;
+    Eigen::Matrix3d dR =
+        Eigen::Matrix3d::Identity() + Skew(delta_omega);
 
-    // 4. 回填到投影矩陣
-    project_matrix.block<3,3>(0,0) = T_new.block<3,3>(0,0);
-    project_matrix.block<3,1>(0,3) = T_new.block<3,1>(0,3);
+    R = dR * R;
+    t = t + delta_t;
+
+     //  保證 R ∈ SO(3)
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+        R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    R = svd.matrixU() * svd.matrixV().transpose();
+
+
+    project_matrix.block<3,3>(0,0) = R;
+    project_matrix.block<3,1>(0,3) = t;
+
+    
 }
