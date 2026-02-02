@@ -53,15 +53,41 @@ void CommonView::create_graph() {
             
             matcher->knnMatch(this->_graph[i].descriptors, this->_graph[j].descriptors, knn_matches, 2);
             
-            std::vector<cv::DMatch> good_matches;
+            //  Lowe's Ratio Test 初選
+            std::vector<cv::DMatch> ratio_matches;
+            std::vector<cv::Point2d> pts1, pts2;
             for (const auto &m : knn_matches) {
                 if (m.size() == 2 && m[0].distance < ratio_thresh * m[1].distance) {
-                    good_matches.push_back(m[0]);
+                    ratio_matches.push_back(m[0]);
+                    pts1.push_back(this->_graph[i].keyPoints[m[0].queryIdx].pt);
+                    pts2.push_back(this->_graph[j].keyPoints[m[0].trainIdx].pt);
                 }
             }
-            this->_graph[i].edges[j] = {true, good_matches};
+
+            // RANSAC 幾何驗證去除噪音點 
+            std::vector<cv::DMatch> final_matches;
+            if (pts1.size() >= 8) { // 計算基礎矩陣至少需要 8 個點
+                std::vector<uchar> mask;
+                // 使用 RANSAC 尋找符合極線幾何 (Epipolar Geometry) 的點
+                cv::findFundamentalMat(pts1, pts2, cv::FM_RANSAC, 3.0, 0.99, mask);
+
+                for (size_t k = 0; k < mask.size(); k++) {
+                    if (mask[k]) { // 只有 mask 為 1 的才是 Inliers
+                        final_matches.push_back(ratio_matches[k]);
+                    }
+                }
+            }
+
+            // 只有當匹配數量足夠時才建立邊
+            if (final_matches.size() > 5) { 
+                this->_graph[i].edges[j] = {true, final_matches};
+            } else {
+                this->_graph[i].edges[j] = {false, {}};
+            }
         }
+            
     }
+    
 }
 
 
