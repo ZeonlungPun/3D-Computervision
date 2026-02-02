@@ -93,8 +93,8 @@ void Rebuild::init()
         // get the external paremeters use ePnP
         
         // 3d-2d correspondences
-        std::vector<cv::Point3f> p3ds;
-        std::vector<cv::Point2f> p2ds;
+        std::vector<cv::Point3d> p3ds;
+        std::vector<cv::Point2d> p2ds;
         for (int i = 0; i < this->_points_state.size(); i++) 
         {
             int track_id = this->_points_state[i];
@@ -104,10 +104,10 @@ void Rebuild::init()
                 int kp_id = e.second;
                 if (img_id == max_img_id) {
                     Eigen::Vector3d p3d = this->_points_cloud[i];
-                    p3ds.push_back(cv::Point3f(p3d(0), p3d(1), p3d(2)));
-                    float p2d_x = this->_commonView._graph[max_img_id].keyPoints[kp_id].pt.x;
-                    float p2d_y = this->_commonView._graph[max_img_id].keyPoints[kp_id].pt.y;
-                    p2ds.push_back(cv::Point2f(p2d_x, p2d_y));
+                    p3ds.push_back(cv::Point3d(p3d(0), p3d(1), p3d(2)));
+                    double p2d_x = this->_commonView._graph[max_img_id].keyPoints[kp_id].pt.x;
+                    double p2d_y = this->_commonView._graph[max_img_id].keyPoints[kp_id].pt.y;
+                    p2ds.push_back(cv::Point2d(p2d_x, p2d_y));
                 }
             }
         }
@@ -119,12 +119,7 @@ void Rebuild::init()
         K_eigen(0,0), K_eigen(0,1), K_eigen(0,2),
         K_eigen(1,0), K_eigen(1,1), K_eigen(1,2),
         K_eigen(2,0), K_eigen(2,1), K_eigen(2,2));
-        if (p3ds.size() < 4) {
-            std::cout << "Warning: Not enough points for PnP on image " << max_img_id 
-                    << ". Points: " << p3ds.size() << ". Skipping this view." << std::endl;
-            this->_cameras_state[max_img_id] = true; // 標記為已處理避免死迴圈
-            continue; 
-        }
+       
 
         cv::solvePnPRansac(
             p3ds,               // std::vector<cv::Point3f>
@@ -143,6 +138,7 @@ void Rebuild::init()
 
         cv::Mat R_cv;
         cv::Rodrigues(rvec, R_cv);
+        std::cout<< "R_cv type:"<<  R_cv.type() << std::endl;
         Eigen::Matrix3d R_eigen;
         Eigen::Vector3d t_eigen;
         for (int r = 0; r < 3; r++) {
@@ -235,8 +231,8 @@ void Rebuild::init_reconstruct(int id1, int id2, std::vector<cv::DMatch> success
     
     Node node1 = this->_commonView._graph[id1];
     Node node2 = this->_commonView._graph[id2];
-    std::vector<cv::Point2f> points1;
-    std::vector<cv::Point2f> points2;
+    std::vector<cv::Point2d> points1;
+    std::vector<cv::Point2d> points2;
     for (int i = 0; i < success_matches.size(); i++) {
       
         int queryIdx = success_matches[i].queryIdx;
@@ -258,6 +254,7 @@ void Rebuild::init_reconstruct(int id1, int id2, std::vector<cv::DMatch> success
     cv::Mat E, mask, R12,t12;
     E = cv::findEssentialMat(points1, points2, K, cv::RANSAC, 0.99, 1.0, mask);
     int inliers = cv::recoverPose(E, points1, points2, K, R12,t12,mask);
+   
 
     //update the camera pose
     this->_cameras[id1]._R = Eigen::Matrix3d::Identity();
@@ -282,12 +279,18 @@ void Rebuild::init_reconstruct(int id1, int id2, std::vector<cv::DMatch> success
     //triangulate points
     cv::Mat points4D;// 輸出：3D 點座標 (4xN, 齊次座標)
     cv::triangulatePoints(P1, P2, points1, points2, points4D);
+    CV_Assert(points4D.type() == CV_64F);
+    std::cout << "points4D type after triangulate = "
+          << points4D.type() << std::endl;
+    
     //convert to euclidean coordinates
     
     for (int i = 0; i < points4D.cols; i++) 
     {
-        
+        // only keep the inliner
+        if (mask.at<uchar>(i) == 0) continue;
         double w = points4D.at<double>(3, i);
+        
         if (std::abs(w) < 1e-6) continue;
         Eigen::Vector3d point3d;
         point3d(0) = points4D.at<double>(0, i) / w;
@@ -300,7 +303,7 @@ void Rebuild::init_reconstruct(int id1, int id2, std::vector<cv::DMatch> success
         Eigen::Vector3d p_c2 = this->_cameras[id2]._R * point3d + this->_cameras[id2]._t;
 
         // 點必須在兩個相機的前方 (Z > 0)
-        if (p_c1.z() <= 0.001 || p_c2.z() <= 0.001) {
+        if (p_c1.z() <= 0.0001 || p_c2.z() <= 0.0001) {
             continue; 
         }
 
@@ -332,7 +335,7 @@ void Rebuild::reconstruct(int id1, int id2, std::vector<cv::DMatch> success_matc
     //get the matching points
     Node node1 = this->_commonView._graph[id1];
     Node node2 = this->_commonView._graph[id2];
-    std::vector<cv::Point2f> points1, points2;
+    std::vector<cv::Point2d> points1, points2;
      //record  the  key points id
     std::vector<int> state1, state2;
     for (int i = 0; i < success_matches.size(); i++) {
@@ -383,7 +386,7 @@ void Rebuild::reconstruct(int id1, int id2, std::vector<cv::DMatch> success_matc
         if (this->_tracks_state[track_id]) continue;
 
         double w = points4D.at<double>(3, i);
-        std::cout << "w: " << w << std::endl;
+        
         // 簡單的數值穩定性檢查，防止除以 0 或過小的 w
         if (std::abs(w) < 1e-6) continue;
 
