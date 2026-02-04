@@ -122,8 +122,8 @@ void Rebuild::init()
        
 
         cv::solvePnPRansac(
-            p3ds,               // std::vector<cv::Point3f>
-            p2ds,               // std::vector<cv::Point2f>
+            p3ds,               // std::vector<cv::Point3d>
+            p2ds,               // std::vector<cv::Point2d>
             K,                  // 相機內參
             cv::Mat(),          // 畸變係數 (如果已校正，傳空)
             rvec,               // 輸出：旋轉向量
@@ -660,4 +660,247 @@ void Rebuild::save_point_cloud(const std::string &filename)
     outfile.close();
     std::cout << "Point cloud saved as CSV to " << filename 
               << " (" << saved_count << " points)" << std::endl;
+}
+
+
+cv::Mat eigen2cv(const Eigen::Matrix3d& mat) {
+    cv::Mat cv_mat(3, 3, CV_64F);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            cv_mat.at<double>(i, j) = mat(i, j);
+    return cv_mat;
+}
+
+cv::Mat eigen2cv_vec(const Eigen::Vector3d& vec) {
+    cv::Mat cv_vec(3, 1, CV_64F);
+    for (int i = 0; i < 3; i++) cv_vec.at<double>(i, 0) = vec(i);
+    return cv_vec;
+}
+
+cv::Mat eigen2cv_dist(const Eigen::VectorXd& vec) {
+    // 假設是 5 個畸變參數 (k1, k2, p1, p2, k3)
+    cv::Mat cv_dist(1, 5, CV_64F);
+    for (int i = 0; i < vec.size() && i < 5; i++) cv_dist.at<double>(0, i) = vec(i);
+    return cv_dist;
+}
+
+void Rebuild::compute_stereo_depth(
+    const cv::Mat& img1, const cv::Mat& img2, 
+    const Camera& cam1, const Camera& cam2, 
+    cv::Mat& out_depth, cv::Mat& out_rectified_img1,
+    Eigen::Matrix3d& out_new_K, Eigen::Matrix3d& out_rect_R) 
+{
+    // 1. 準備相機參數
+    cv::Mat K1 = eigen2cv(cam1._K);
+    cv::Mat D1 = eigen2cv_dist(cam1._dist);
+    cv::Mat K2 = eigen2cv(cam2._K);
+    cv::Mat D2 = eigen2cv_dist(cam2._dist);
+
+    // 2. 計算相對位姿 (Cam1 -> Cam2)
+    // P_c2 = R_rel * P_c1 + T_rel
+    // R_rel = R2 * R1^T
+    // T_rel = t2 - R_rel * t1
+    Eigen::Matrix3d R_rel_eig = cam2._R * cam1._R.transpose();
+    Eigen::Vector3d T_rel_eig = cam2._t - R_rel_eig * cam1._t;
+
+    cv::Mat R_rel = eigen2cv(R_rel_eig);
+    cv::Mat T_rel = eigen2cv_vec(T_rel_eig);
+
+    // 3. 立體校正 (Stereo Rectify)
+    // 這會計算讓兩張圖極線平行的變換矩陣 (R1, R2) 和新的投影矩陣 (P1, P2)
+    cv::Mat R1, R2, P1, P2, Q;
+    cv::stereoRectify(K1, D1, K2, D2, img1.size(), R_rel, T_rel, 
+                      R1, R2, P1, P2, Q, 
+                      cv::CALIB_ZERO_DISPARITY, 0, img1.size()); // alpha=0 盡量保留有效像素
+
+    // 4. 建立校正映射表 (Undistort & Rectify Map)
+    cv::Mat map11, map12, map21, map22;
+    cv::initUndistortRectifyMap(K1, D1, R1, P1, img1.size(), CV_16SC2, map11, map12);
+    cv::initUndistortRectifyMap(K2, D2, R2, P2, img2.size(), CV_16SC2, map21, map22);
+
+    // 5. 影像重映射 (Remap) - 這是 Open3D 之後要用的 RGB
+    cv::Mat img1_rect, img2_rect;
+    cv::remap(img1, img1_rect, map11, map12, cv::INTER_LINEAR);
+    cv::remap(img2, img2_rect, map21, map22, cv::INTER_LINEAR);
+    
+    // 轉換為灰階進行匹配
+    cv::Mat img1_gray, img2_gray;
+    cv::cvtColor(img1_rect, img1_gray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(img2_rect, img2_gray, cv::COLOR_BGR2GRAY);
+
+    // 6. SGBM 視差計算
+    // 參數需要根據圖像解析度調整，這裡給出一組通用參數
+    int minDisparity = 0;
+    int numDisparities = 16 * 8; // 必須是16的倍數
+    int blockSize = 5;
+    
+    cv::Ptr<cv::StereoSGBM> sgbm = cv::StereoSGBM::create(
+        minDisparity, numDisparities, blockSize,
+        8 * 3 * blockSize * blockSize,   // P1
+        32 * 3 * blockSize * blockSize,  // P2
+        1, 63, 10, 100, 32, cv::StereoSGBM::MODE_SGBM_3WAY
+    );
+
+    cv::Mat disp;
+    sgbm->compute(img1_gray, img2_gray, disp);
+
+    // 7. 視差轉深度 (Disparity to Depth)
+    // Z = f * B / d
+    // Q矩陣包含了 f*B 的資訊，可以直接用 reprojectImageTo3D
+    // 但為了更精確控制，我們通常手動計算或過濾
+    cv::Mat points3D;
+    cv::reprojectImageTo3D(disp, points3D, Q, true); // handleMissingValues=true
+
+    // 提取 Z 通道 (深度)
+    std::vector<cv::Mat> channels;
+    cv::split(points3D, channels);
+    cv::Mat depth_map = channels[2]; // Z channel
+
+    // 過濾無效值 (SGBM 失敗處通常為極大值或負值)
+    // 設為 0 或 NaN
+    cv::patchNaNs(depth_map, 0.0);
+    cv::threshold(depth_map, depth_map, 1000.0, 0.0, cv::THRESH_TOZERO_INV); // 過濾掉 > 1000m 的點
+    cv::threshold(depth_map, depth_map, 0.0, 0.0, cv::THRESH_TOZERO);      // 過濾掉 < 0 的點
+
+    // 輸出
+    out_depth = depth_map;           // CV_32F, 單位通常是 meters (取決於 t 的單位)
+    out_rectified_img1 = img1_rect;  // 校正後的 RGB
+
+    // 輸出新的相機內參 (P1 的前 3x3)
+    out_new_K << P1.at<double>(0,0), P1.at<double>(0,1), P1.at<double>(0,2),
+                 P1.at<double>(1,0), P1.at<double>(1,1), P1.at<double>(1,2),
+                 P1.at<double>(2,0), P1.at<double>(2,1), P1.at<double>(2,2);
+
+    // 輸出校正旋轉矩陣 (用於修正 Open3D 的 Extrinsics)
+    // R1 是將原始相機旋轉到校正相機的矩陣
+    for(int r=0; r<3; r++)
+        for(int c=0; c<3; c++)
+            out_rect_R(r,c) = R1.at<double>(r,c);
+}
+void save_depth_visualization(const cv::Mat& depth_map, const std::string& filename) {
+    if (depth_map.empty()) return;
+
+    cv::Mat adjMap;
+    // 1. 將深度歸一化到 0-255 (CV_8U)
+    // 注意：這裡要排除掉深度為 0 (無效點) 的部分
+    double minVal, maxVal;
+    cv::minMaxLoc(depth_map, &minVal, &maxVal, NULL, NULL, depth_map > 0);
+    
+    depth_map.convertTo(adjMap, CV_8U, 255.0 / (maxVal - minVal), -minVal * 255.0 / (maxVal - minVal));
+
+    // 2. 加上偽彩色 (Jet 效果：近紅遠藍，或者 Magma 效果)
+    cv::Mat colorMap;
+    cv::applyColorMap(adjMap, colorMap, cv::COLORMAP_JET);
+
+    // 3. 將無效點（深度為 0）標記為黑色
+    colorMap.setTo(cv::Scalar(0, 0, 0), depth_map <= 0);
+
+    cv::imwrite(filename, colorMap);
+}
+
+void Rebuild::generate_depth_maps(const std::vector<cv::Mat>& images) {
+    std::cout << "Starting dense reconstruction..." << std::endl;
+
+    for (int i = 0; i < this->_images_num; i++) {
+        if (!this->_cameras_state[i]) continue; // Skip 未重建的相機
+
+        // 1. 尋找最佳匹配視圖 (Simple heuristic: most shared points)
+        int best_neighbor = -1;
+        int max_shared_points = 0;
+        const int MIN_MATCH_THRESHOLD = 30; // 密集重建通常需要至少一定數量的匹配點來保證校正品質
+
+        for (int j = 0; j < this->_images_num; j++) {
+            if (i == j || !this->_cameras_state[j]) continue;
+
+            // 處理上三角存儲
+            int u = std::min(i, j);
+            int v = std::max(i, j);
+
+            // 直接檢查 matches 的數量，無視 flag
+            const auto& edge_matches = this->_commonView._graph[u].edges[v].matches;
+            int current_matches_count = static_cast<int>(edge_matches.size());
+
+            if (current_matches_count > max_shared_points && current_matches_count > MIN_MATCH_THRESHOLD) {
+                max_shared_points = current_matches_count;
+                best_neighbor = j;
+            }
+        }
+
+        if (best_neighbor == -1 || max_shared_points < 20) {
+            std::cout << "Skipping view " << i << ": not enough overlap." << std::endl;
+            continue;
+        }
+
+        std::cout << "Processing View " << i << " (Neighbor: " << best_neighbor << ")..." << std::endl;
+
+        // 2. 計算深度
+        cv::Mat depth_map, rect_rgb;
+        Eigen::Matrix3d new_K, rect_R;
+        
+        this->compute_stereo_depth(images[i], images[best_neighbor], 
+                             _cameras[i], _cameras[best_neighbor], 
+                             depth_map, rect_rgb, new_K, rect_R);
+                    
+
+        // 3. 保存數據供 Open3D 使用
+        std::string folder_path = "./output";
+        if (!fs::exists(folder_path)) {
+            if (fs::create_directories(folder_path)) {
+                std::cout << "Successfully created directory: " << folder_path << std::endl;
+            } else {
+                std::cerr << "Critical: Could not create directory!" << std::endl;
+                return;
+            }
+        }
+        // 格式: 0000.jpg (RGB), 0000.png (Depth 16bit), 0000.json (Pose)
+        std::string prefix = "./output/view_" + std::to_string(i);
+
+     
+
+        // A. 保存校正後的 RGB
+        bool success_rgb = cv::imwrite(prefix + ".jpg", rect_rgb);
+
+        // B. 保存深度圖 (Open3D 推薦存為 16-bit PNG, 單位毫米)
+        // 假設 depth_map 單位是米 (根據你的 t 單位)
+        cv::Mat depth_mm;
+        depth_map.convertTo(depth_mm, CV_16U, 1000.0); // m -> mm
+        bool success_depth =  cv::imwrite(prefix + ".png", depth_mm);
+        if (!success_rgb || !success_depth) {
+            std::cerr << "Failed to save images to: " << prefix << std::endl;
+        } else {
+            std::cout << "Successfully saved: " << prefix << std::endl;
+        }
+        // 保存給人類看的可視化 JPG
+        save_depth_visualization(depth_map, prefix + "_vis.jpg"); 
+
+        // 保存校正後的 RGB 影像
+        bool success_vis= cv::imwrite(prefix + "_rect.jpg", rect_rgb);
+        if (!success_vis)
+        {
+            std::cerr << "Failed to save images to: " << prefix << std::endl;
+        }
+        else
+        {
+            std::cout << "Successfully saved: " << prefix << std::endl;
+        }
+
+        // C. 計算並保存 Open3D 需要的 Pose
+        // 原始 Pose (World -> Camera): [R_old | t_old]
+        // 校正旋轉 R_rect (Camera -> Rectified Camera)
+        // 新 Pose (World -> Rectified Camera): R_new = R_rect * R_old
+        // 新 Translation: t_new = R_rect * t_old
+        
+        Eigen::Matrix3d R_new = rect_R * _cameras[i]._R;
+        Eigen::Vector3d t_new = rect_R * _cameras[i]._t;
+        
+        // Open3D 讀取的軌跡通常是 Camera-to-World (Extrinsics 的逆矩陣)
+        // 或者你需要存儲 World-to-Camera 的 Extrinsics
+        // 這裡將 Extrinsics 寫入簡單文本供讀取
+        
+        std::ofstream pose_file(prefix + ".txt");
+        pose_file << "Intrinsic (K):" << std::endl << new_K << std::endl;
+        pose_file << "Extrinsic (R):" << std::endl << R_new << std::endl;
+        pose_file << "Extrinsic (t):" << std::endl << t_new.transpose() << std::endl;
+        pose_file.close();
+    }
 }
