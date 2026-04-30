@@ -157,6 +157,22 @@ def read_colmap_depth_bin(path):
     if channels == 1:
         arr = arr[:, :, 0]
     return arr
+def load_normal_maps(normal_dir, images):
+    normal_maps = {}
+    for img_id, img in images.items():
+        p1 = Path(normal_dir) / f"{img.name}.geometric.bin"
+        p2 = Path(normal_dir) / f"{img.name}.photometric.bin"
+        p3 = Path(normal_dir) / f"{img.name}.bin"
+
+        if p1.exists():
+            normal_maps[img_id] = read_colmap_depth_bin(p1)
+        elif p2.exists():
+            normal_maps[img_id] = read_colmap_depth_bin(p2)
+        elif p3.exists():
+            normal_maps[img_id] = read_colmap_depth_bin(p3)
+
+    return normal_maps
+
 
 def load_depth_maps(depth_dir, images):
     depth_maps = {}
@@ -288,6 +304,7 @@ def fuse_seed(
     cameras,
     images,
     depth_maps,
+    normal_maps,
     overlap_neighbors,
     fused_pixel_masks,
     max_depth_error=0.01,
@@ -326,9 +343,26 @@ def fuse_seed(
     #RGB圖像
         bgr  = images[image_idx].bgr[row, col]
 
-        normal = estimate_normal_from_depth(depth_maps[image_idx], col, row, cam)
-        if normal is None:
+        normal_map = normal_maps.get(image_idx, None)
+        if normal_map is None:
             continue
+
+        nc = normal_map[row, col]  # 注意順序是 [row, col]
+
+        # 檢查合法性
+        if not np.all(np.isfinite(nc)):
+            continue
+
+        norm = np.linalg.norm(nc)
+        if norm < 1e-8:
+            continue
+
+        nc = nc / norm
+
+        # 👉 轉成 world coordinate
+        normal = pose.R.T @ nc
+
+
 
         # traversal_depth > 0 時，做幾何一致性檢查
         if traversal_depth > 0:
@@ -449,6 +483,8 @@ def fuse_all_points(
     cameras = read_cameras_binary(Path(sparse_path) / "cameras.bin")
     images = read_images_binary(Path(sparse_path) / "images.bin")
     depth_maps = load_depth_maps(depth_map_dir, images)
+    normal_map_dir = Path(depth_map_dir).parent / "normal_maps"
+    normal_maps = load_normal_maps(normal_map_dir, images)
 
     overlap_neighbors = build_overlap_neighbors(images, k=neighbor_k)
 
@@ -482,6 +518,7 @@ def fuse_all_points(
                     cameras=cameras,
                     images=images,
                     depth_maps=depth_maps,
+                    normal_maps=normal_maps,
                     overlap_neighbors=overlap_neighbors,
                     fused_pixel_masks=fused_pixel_masks,
                     max_depth_error=max_depth_error,
